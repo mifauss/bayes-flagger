@@ -4,16 +4,15 @@ import numpy.typing as npt
 from scipy.optimize import Bounds, minimize  # type: ignore
 from scipy.special import expit  # type: ignore
 from scipy.stats import beta, entropy, norm  # type: ignore
-from sklearn import svm  # type: ignore
 from sklearn.exceptions import NotFittedError  # type: ignore
-from sklearn.pipeline import make_pipeline  # type: ignore
-from sklearn.preprocessing import StandardScaler  # type: ignore
-from sklearn.utils.validation import check_is_fitted  # type: ignore
+from sklearn.linear_model import SGDClassifier  # type: ignore
+from sklearn.neural_network import MLPClassifier  # type: ignore
 from tmvbeta import TMVBeta
-from typing import Union
+from typing import Any, Union
+
 
 # Custom types
-anyfloat = Union[float, np.float64]
+anyfloat = Union[float, np.floating[Any]]
 anyfloat_or_array = Union[anyfloat, npt.NDArray[np.float64]]
 
 
@@ -200,7 +199,7 @@ class BayesFlaggerBeta:
         # Prior group probabilities
         pc = self.update_pc(self.model)
 
-        # Try fixed-point iteration for 2 * self.N iterations
+        # Try fixed-point iteration for 2 * N iterations
         diff: anyfloat = 0.0
         for it in range(2 * self.N):
             # Update pc
@@ -220,13 +219,12 @@ class BayesFlaggerBeta:
 
         # Check accuracy of solution
         if diff > 1e-4:
-            print("Fixed-point iteration did not converge, minimizing squared error instead.")
-            self.update_posterior_least_squares(update_model=update_model, verbose=verbose)
+            print("Fixed-point iteration did not converge, using last iterate.")
+
         # Update group probabilities and model
-        else:
-            self.pc = pc
-            if update_model:
-                self.model = self.update_model(pc)
+        self.pc = pc
+        if update_model:
+            self.model = self.update_model(pc)
 
     def update_posterior_least_squares(self, update_model: bool = False, verbose: bool = False) -> None:
         """
@@ -234,7 +232,7 @@ class BayesFlaggerBeta:
         Store updated model if `update_model` parameter is set, discard otherwise.
         """
 
-        def objective(pc_no_review: npt.NDArray[np.float64]) -> np.float64:
+        def objective(pc_no_review: npt.NDArray[np.float64]) -> np.floating[Any]:
             """
             Square error cost function for posterior group probabilities
             of unreviewed samples. Reviewed samples have prob = {0,1}.
@@ -279,44 +277,43 @@ class BayesFlaggerBeta:
             self.model = self.update_model(pc)
 
 
-class SVMFlagger:
+class PLFlagger:
     """
-    Flagger based on an SVM trained on reviewed samples only. Used to establish 
-    baseline performance in [...]
+    Flagger using pseudo labeling (PL) in combination with a stochastic gradient descent (SGD) classifier.
     """
-    def __init__(self, K: int, M: int) -> None:
-        """
-        Initialize SVM flagger.
 
-        K:  Number of samples to be flagged for review
-        M:  Number of features (= length of feature vectors)
+    def __init__(self, K: int, M: int, lr: float = 1e-4, loss: str = "hinge") -> None:
+        """
+        Initialize flagger.
+
+        K:      Number of samples to be flagged for review
+        M:      Number of features (= length of feature vectors)
+        lr:     Learning rate
+        loss:   Loss function
         """
         # Parameters
         self.M = M
         self.K = K
+        self.lr = lr
+        self.loss = loss
 
-        # Classifier and per admin variables
-        self.clf = make_pipeline(StandardScaler(), svm.SVC())
-        self.reset(False)
+        self.reset(True)
 
     def reset(self, reset_classifier: bool = True) -> None:
         """Reset classifier and per admin variables."""
         # Classifier
         if reset_classifier:
-            self.clf = make_pipeline(StandardScaler(), svm.SVC())
+            self.clf = SGDClassifier(loss=self.loss, learning_rate="constant", eta0=self.lr)
 
         # Reviewed samples with labels
-        self.X0 = np.empty((0, self.M))
-        self.X1 = np.empty((0, self.M))
-        self.y0 = np.empty(0)
-        self.y1 = np.empty(0)
+        self.X = np.empty((0, self.M))
+        self.y = np.empty(0)
 
         # Per admin variables
         self.N = 0
         self.X = np.empty((0, 0), np.float64)
         self.s = np.empty(0, bool)
-        self.d0 = np.empty(0, bool)
-        self.d1 = np.empty(0, bool)
+        self.d = np.empty(0, bool)
 
         # Decision function
         self.df = np.empty(0, np.float64)
@@ -335,44 +332,165 @@ class SVMFlagger:
 
         # Reset per admin variables
         self.N = N
+        self.c = np.full(N, False)
         self.s = np.full(N, False)
-        self.d0 = np.full(N, False)
-        self.d1 = np.full(N, False)
+        self.d = np.full(N, False)
 
     def flag(self) -> None:
-        """Flag observed samples most likely to belong to critical group."""
+        """Flag samples with highest decision function value."""
+        # Sample randomly if posterior probabilities are all equal
         if self.df.min() == self.df.max():
-            self.s[np.random.choice(np.arange(self.N), self.K, replace=False)] = True
+            self.s[np.random.choice(range(self.N), self.K, replace=False)] = True
         else:
             self.s[np.argpartition(self.df, -self.K)[-self.K :]] = True
 
     def review(self, c: npt.NDArray[np.bool_]) -> None:
-        """
-        Incorporate review outcomes for flagged cases, and add corresponding
-        samples and labels to training data set.
-        """
-        self.d0 = self.s * (~c)
-        self.d1 = self.s * c
-        self.n_detected += int(np.sum(self.d1))
-
-        self.X0 = np.concatenate((self.X0, self.X[self.d0]))
-        self.X1 = np.concatenate((self.X1, self.X[self.d1]))
-        self.y0 = np.concatenate((self.y0, np.zeros(int(np.sum(self.d0)))))
-        self.y1 = np.concatenate((self.y1, np.ones(int(np.sum(self.d1)))))
+        """Incorporate review outcomes for flagged cases."""
+        self.c = c
+        self.d = self.s * self.c
+        self.n_detected += int(np.sum(self.d))
 
     def update_df(self) -> None:
-        """Calculate decision function for current sample."""
+        """Update decision function for current sample."""
         try:
-            check_is_fitted(self.clf)
             self.df = self.clf.decision_function(self.X)
         except NotFittedError:
-            self.df = np.zeros(self.N)
+            self.df = np.full(self.X.shape[0], 0.0)
 
-    def update_svm(self) -> None:
-        """Update classifier using training data observed so far."""
-        # Check that samples from both classes have been observed
-        if np.minimum(self.y0.size, self.y1.size) > 0:
-            X = np.concatenate((self.X1, self.X0))
-            y = np.concatenate((self.y1, self.y0))
-            self.clf = make_pipeline(StandardScaler(), svm.SVC())
-            self.clf.fit(X, y)
+    def sgd_labeled(self) -> None:
+        """Update classifier by running SGD step using labeled (reviewed) samples."""
+        self.clf.partial_fit(self.X[self.s], 2 * self.c[self.s] - 1, classes=[-1, 1])
+
+    def sgd_unlabeled(self):
+        """Update classifier by running SGD step using pseudo-labeled samples."""
+        # Threshold for pseudo-labeling positives
+        if np.any(self.d):
+            df_pos = np.min(self.df[self.d])
+        else:
+            df_pos = np.inf
+
+        # Threshold for pseudo-labeling negatives
+        if np.any(np.logical_and(~self.d, self.s)):
+            df_neg = np.max(self.df[np.logical_and(~self.d, self.s)])
+        else:
+            df_neg = -np.inf
+
+        # Assign pseudo labels
+        mask = np.logical_or(self.df >= df_pos, self.df <= df_neg)
+        mask = np.logical_and(mask, ~self.s)
+
+        # Run SGD step if any samples were labeled
+        if np.any(mask):
+            self.clf.partial_fit(self.X[mask], np.sign(self.df[mask]), classes=[-1, 1])
+
+
+class PLNNFlagger:
+    """
+    Flagger using pseudo labeling (PL) in combination with a single hidden layer neural network (NN) classifier.
+    """
+
+    def __init__(self, K: int, M: int, lr: float = 0.001, n_hidden: int = 10) -> None:
+        """
+        Initialize flagger.
+
+        K:          Number of samples to be flagged for review
+        M:          Number of features (= length of feature vectors)
+        lr:         Learning rate
+        n_hidden:   Width of hidden layer
+        """
+        # Parameters
+        self.M = M
+        self.K = K
+        self.lr = lr
+        self.n_hidden = n_hidden
+
+        self.reset(True)
+
+    def reset(self, reset_classifier: bool = True) -> None:
+        """Reset classifier and per admin variables."""
+        # Classifier
+        if reset_classifier:
+            self.clf = MLPClassifier(
+                hidden_layer_sizes=(self.n_hidden,),
+                # solver="sgd",
+                # learning_rate="invscaling",
+                learning_rate_init=self.lr,
+            )
+
+        # Reviewed samples with labels
+        self.X = np.empty((0, self.M))
+        self.y = np.empty(0)
+
+        # Per admin variables
+        self.N = 0
+        self.X = np.empty((0, 0), np.float64)
+        self.s = np.empty(0, bool)
+        self.d = np.empty(0, bool)
+
+        # Decision function
+        self.pc = np.empty(0, np.float64)
+
+        # Counters
+        self.n_detected = 0
+
+    def observe(self, X: npt.NDArray[np.float64]) -> None:
+        """Observe `N` feature vectors of length `M` stacked into an N x M matrix `X`."""
+        self.X = np.atleast_2d(X)
+        N, M = self.X.shape
+
+        # Check feature vector length
+        if M != self.M:
+            raise ValueError(f"Feature vector length is {M}, expected {self.M}")
+
+        # Reset per admin variables
+        self.N = N
+        self.c = np.full(N, False)
+        self.s = np.full(N, False)
+        self.d = np.full(N, False)
+
+    def flag(self) -> None:
+        """Flag samples with highest decision function value."""
+        # Sample randomly if posterior probabilities are all equal
+        if self.pc.min() == self.pc.max():
+            self.s[np.random.choice(range(self.N), self.K, replace=False)] = True
+        else:
+            self.s[np.argpartition(self.pc, -self.K)[-self.K :]] = True
+
+    def review(self, c: npt.NDArray[np.bool_]) -> None:
+        """Incorporate review outcomes for flagged cases."""
+        self.c = c
+        self.d = self.s * self.c
+        self.n_detected += int(np.sum(self.d))
+
+    def update_df(self) -> None:
+        """Update decision function for current sample."""
+        try:
+            self.pc = self.clf.predict_proba(self.X)[:, 1]
+        except NotFittedError:
+            self.pc = np.full(self.X.shape[0], 0.5)
+
+    def sgd_labeled(self) -> None:
+        """Update classifier by running SGD step using labeled (reviewed) samples."""
+        self.clf.partial_fit(self.X[self.s], self.c[self.s], classes=[0, 1])
+
+    def sgd_unlabeled(self):
+        """Update classifier by running SGD step using pseudo-labeled samples."""
+        # Threshold for pseudo-labeling positives
+        if np.any(self.d):
+            pc_1 = np.min(self.pc[self.d])
+        else:
+            pc_1 = 1.0
+
+        # Threshold for pseudo-labeling negatives
+        if np.any(np.logical_and(~self.d, self.s)):
+            pc_0 = np.max(self.pc[np.logical_and(~self.d, self.s)])
+        else:
+            pc_0 = 0.0
+
+        # Assign pseudo labels
+        mask = np.logical_or(self.pc >= pc_1, self.pc <= pc_0)
+        mask = np.logical_and(mask, ~self.s)
+
+        # Run SGD step if any samples were labeled
+        if np.any(mask):
+            self.clf.partial_fit(self.X[mask], np.round(self.pc[mask]), classes=[0, 1])

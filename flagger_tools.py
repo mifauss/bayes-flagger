@@ -2,12 +2,12 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
-from flagger import anyfloat, BayesFlaggerBeta, SVMFlagger, PosteriorModel
+from flagger import anyfloat, BayesFlaggerBeta, PLFlagger, PosteriorModel
 from scipy.integrate import dblquad  # type: ignore
 from scipy.special import betaln  # type: ignore
 from scipy.stats import binom  # type: ignore
 from tmvbeta import TMVBeta
-from typing import Callable, Tuple
+from typing import Any, Callable, Tuple
 
 # Custom types
 Sampler = Callable[[int], Tuple[npt.NDArray[np.bool_], npt.NDArray[np.float64]]]
@@ -48,7 +48,7 @@ def get_sampler_data(r: anyfloat, df0: pd.core.frame.DataFrame, df1: pd.core.fra
 
 class ModelError:
     """Error metrics for posterior model evaluation."""
-    
+
     def __init__(
         self, r: anyfloat, a: npt.NDArray[np.float64], b: npt.NDArray[np.float64], cov: npt.NDArray[np.float64]
     ):
@@ -98,7 +98,7 @@ class ModelError:
         """Square error of MAP estimate of `R` for given posterior."""
         return (model.v[1] / model.v.sum() - self.r) ** 2
 
-    def map_square_error_cov(self, i: int, model: PosteriorModel) -> np.float64:
+    def map_square_error_cov(self, i: int, model: PosteriorModel) -> np.floating[Any]:
         """Square error of MAP estimate of covarinace matrix of `X_i` for given posterior."""
         return np.linalg.norm(model.psi[i] / (model.v[i] + model.M + 1) - self.cov[i]) ** 2
 
@@ -150,13 +150,14 @@ class BayesFlaggerBetaTest:
         return np.array(n_total), np.array(n_detected), model, np.array(phi)
 
 
-class SVMFlaggerTest:
-    """Wrapper class to simulate SVMFlagger."""
+class PLFlaggerTest:
+    """Wrapper class to simulate PLFlagger."""
 
-    def __init__(self, flagger: SVMFlagger, sampler: Sampler, N: int) -> None:
+    def __init__(self, flagger: PLFlagger, sampler: Sampler, N: int, t_warmup: int = 0) -> None:
         """Initialize test with given `flagger`, `sampler` and sample size `N`."""
         self.flagger = flagger
         self.sampler = sampler
+        self.t_warmup = t_warmup
         self.N = N
 
     def run(self, T: int, verbose: bool = False):
@@ -177,7 +178,10 @@ class SVMFlaggerTest:
             self.flagger.update_df()
             self.flagger.flag()
             self.flagger.review(c)
-            self.flagger.update_svm()
+            self.flagger.sgd_labeled()
+            if t >= self.t_warmup:
+                self.flagger.update_df()
+                self.flagger.sgd_unlabeled()
 
             n_total.append(n_total[-1] + int(np.sum(c)))
             n_detected.append(self.flagger.n_detected)
