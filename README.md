@@ -1,4 +1,4 @@
-Code for _Bayesian Selection Policies for Human-in-the-Loop Anomaly Detectors with Applications in Test Security
+Code for _Bayesian Selection Policies for Human-in-the-Loop Anomaly Detectors with Applications in Test Security_
 =====================================
 
 This repository contains Python code and data to re-generate the numerical results in the paper _Bayesian Selection Policies for Human-in-the-Loop Anomaly Detectors with Applications in Test Security_.  
